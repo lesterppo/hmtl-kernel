@@ -1,0 +1,12 @@
+# Build artifacts
+target/
+
+# Python virtual env
+.venv/
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/

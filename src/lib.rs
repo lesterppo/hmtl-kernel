@@ -23,6 +23,6 @@ pub mod telemetry_real;
 pub use types::Fp8;
 pub use kernel_state::{KernelStateMatrix, TelemetryCollector, NUM_AXES, NUM_CORES};
 pub use memory::{SharedMemoryContext, CxlAllocator};
-pub use actuator::{Actuator, ActuatorCommand, DispatchTable, CoreTrampoline};
+pub use actuator::{Actuator, ActuatorCommand, ActuatorError, DispatchTable, CoreTrampoline};
 pub use cmtip::{TensorPacketHeader, TensorPacket, LinearAdapter, PenaltyTensor, CmtipBus, CmtipError};
 pub use paged_tensor::PagedTensorManager;

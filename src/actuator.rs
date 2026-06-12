@@ -142,14 +142,27 @@ impl DispatchTable {
 //
 // "Find max" uses branch-free comparison: cmp + cmov.
 
+/// Error type for actuator dispatch failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActuatorError {
+    /// The computed best_core exceeds the system's actual core count.
+    CoreIndexOutOfBounds { best_core: usize, num_cpus: usize },
+    /// The dispatch table allocation failed (mmap returned MAP_FAILED).
+    DispatchTableAllocationFailed,
+}
+
 pub struct Actuator {
     dispatch_table: DispatchTable,
+    /// Cached actual CPU count (queried at init time).
+    num_cpus: usize,
 }
 
 impl Actuator {
     pub fn new() -> Self {
+        let num_cpus_val = num_cpus::get();
         Actuator {
             dispatch_table: DispatchTable::new(),
+            num_cpus: num_cpus_val,
         }
     }
 
@@ -158,7 +171,16 @@ impl Actuator {
     /// # Safety
     /// Must be called from kernel context with interrupts disabled.
     /// The ActuatorCommand must point to valid CXL-shared memory.
-    pub unsafe fn dispatch_one(&self, cmd: &ActuatorCommand, task_id: usize) -> usize {
+    ///
+    /// # Errors
+    /// Returns `ActuatorError::CoreIndexOutOfBounds` if the computed best_core
+    /// exceeds the system's actual CPU count, preventing a jump to an invalid
+    /// trampoline entry and consequent SIGILL.
+    pub unsafe fn dispatch_one(
+        &self,
+        cmd: &ActuatorCommand,
+        task_id: usize,
+    ) -> Result<usize, ActuatorError> {
         let row = &cmd.target_dispatch_map[task_id];
 
         // ─── Branch-free argmax ─────────────────────────────────────────
@@ -194,26 +216,43 @@ impl Actuator {
             best_val = best_val.max(val);
         }
 
+        // ─── Bounds guard: prevent jumping to a non-existent core ───────
+        // The dispatch_table has MAX_CORES (128) entries, but the system may
+        // have fewer physical cores.  best_core can be up to 127; we must
+        // ensure it does not exceed self.num_cpus to avoid SIGILL.
+        if best_core >= self.num_cpus || best_core >= MAX_CORES {
+            return Err(ActuatorError::CoreIndexOutOfBounds {
+                best_core,
+                num_cpus: self.num_cpus,
+            });
+        }
+
         // ─── Computed dispatch ──────────────────────────────────────────
         // Jump to the trampoline for best_core.  The trampoline returns
         // the core ID in rax, which we then use to set affinity.
         let trampoline: extern "C" fn() -> usize =
             core::mem::transmute(self.dispatch_table.trampoline_ptr(best_core));
 
-        trampoline()
+        Ok(trampoline())
     }
 
     /// Full dispatch loop — iterate over all 128 task rows.
     ///
     /// In production, this runs inside the timer interrupt handler (APIC timer
     /// or LAPIC deadline timer), replacing the Linux CFS scheduler tick.
+    ///
+    /// Silently skips tasks whose best_core is out of bounds (should not happen
+    /// under normal operation once the bounds guard is in place).
     pub unsafe fn dispatch_all(&self, cmd: &ActuatorCommand) {
         for task_id in 0..128 {
-            let target_core = self.dispatch_one(cmd, task_id);
-            // Set CPU affinity: pin task `task_id` to `target_core`.
-            // On Linux this would call sched_setaffinity; in bare-metal
-            // we'd write directly to the Local APIC ICR to send an IPI.
-            set_task_affinity(task_id, target_core);
+            if let Ok(target_core) = self.dispatch_one(cmd, task_id) {
+                // Set CPU affinity: pin task `task_id` to `target_core`.
+                // On Linux this would call sched_setaffinity; in bare-metal
+                // we'd write directly to the Local APIC ICR to send an IPI.
+                set_task_affinity(task_id, target_core);
+            }
+            // Bounds error silently skipped — in production this would be
+            // logged to the kernel ring buffer.
         }
     }
 }
@@ -290,6 +329,28 @@ mod tests {
 
         let actuator = Actuator::new();
         let result = unsafe { actuator.dispatch_one(&cmd, 0) };
-        assert_eq!(result, 42, "Dispatch should select core 42");
+        assert!(result.is_ok(), "Dispatch should succeed");
+        assert_eq!(result.unwrap(), 42, "Dispatch should select core 42");
+    }
+
+    #[test]
+    fn dispatch_rejects_oob_core() {
+        // Test: when the system has very few cores, dispatch_one should
+        // refuse to jump to a trampoline beyond the actual core count.
+        // This test verifies the bounds guard exists.
+        let mut cmd = ActuatorCommand {
+            target_dispatch_map: [[Fp8::ZERO; 128]; 128],
+        };
+        // Set core 127 as best (likely out of bounds on any real system)
+        cmd.target_dispatch_map[0][127] = Fp8::ONE;
+        // Set core 126 slightly lower
+        cmd.target_dispatch_map[0][126] = Fp8::from_f32(0.5);
+
+        let actuator = Actuator::new();
+        // If num_cpus <= 127, this should return Err
+        if actuator.num_cpus <= 127 {
+            let result = unsafe { actuator.dispatch_one(&cmd, 0) };
+            assert!(result.is_err(), "Should reject OOB core index");
+        }
     }
 }

@@ -116,9 +116,10 @@ pub struct TensorPacket<const N: usize> {
 // analysis (CCA) of co-occurring activations.
 
 pub struct LinearAdapter {
-    /// Projection matrix: W_{A→B}
-    /// Stored row-major: weight[row][col]
-    pub weight: Vec<Vec<f32>>,
+    /// Projection matrix: W_{A→B} stored as a flat row-major slice.
+    /// Element at (row, col) is at index `row * output_dim + col`.
+    /// Flat layout improves cache locality over Vec<Vec<f32>>.
+    pub weight: Vec<f32>,
     pub input_dim: usize,  // d_A
     pub output_dim: usize, // d_B
 }
@@ -126,20 +127,18 @@ pub struct LinearAdapter {
 impl LinearAdapter {
     /// Create a new adapter with random orthogonal initialization.
     pub fn new(input_dim: usize, output_dim: usize) -> Self {
-        // Orthogonal initialization: QR decomposition of random matrix.
-        // For small dimensions we use a simple Gram-Schmidt approach.
-        let mut weight = vec![vec![0.0_f32; output_dim]; input_dim];
-        // Simple random initialization (in production: use QR)
+        let len = input_dim * output_dim;
+        let mut weight = vec![0.0_f32; len];
+        // Kaiming uniform scaled for the projection
+        let scale = (2.0_f32 / (input_dim as f32)).sqrt();
         for i in 0..input_dim {
             for j in 0..output_dim {
-                // Kaiming uniform scaled for the projection
-                let scale = (2.0 / (input_dim as f32)).sqrt();
-                weight[i][j] = (i.wrapping_mul(2654435761) ^ j.wrapping_mul(1597334677))
+                let val = (i.wrapping_mul(2654435761) ^ j.wrapping_mul(1597334677))
                     as f32
                     / u32::MAX as f32
                     * 2.0
                     - 1.0;
-                weight[i][j] *= scale;
+                weight[i * output_dim + j] = val * scale;
             }
         }
         LinearAdapter {
@@ -151,7 +150,7 @@ impl LinearAdapter {
 
     /// Project a vector from model A's space to model B's space.
     ///
-    /// X_B[j] = Σ_i X_A[i] · W[i][j]
+    /// X_B[j] = Σ_i X_A[i] · W[i * output_dim + j]
     pub fn project(&self, input: &[f32]) -> Vec<f32> {
         assert_eq!(
             input.len(),
@@ -162,10 +161,11 @@ impl LinearAdapter {
         );
 
         let mut output = vec![0.0_f32; self.output_dim];
-        for (i, &x_i) in input.iter().enumerate() {
-            let row = &self.weight[i];
-            for (j, &w_ij) in row.iter().enumerate() {
-                output[j] += x_i * w_ij;
+        for i in 0..self.input_dim {
+            let row_offset = i * self.output_dim;
+            let x_i = input[i];
+            for j in 0..self.output_dim {
+                output[j] += x_i * self.weight[row_offset + j];
             }
         }
         output
@@ -179,9 +179,12 @@ impl LinearAdapter {
     /// Update adapter weights via gradient descent (online adaptation).
     /// dL/dW = X_A^T · dL/dX_B
     pub fn update_weights(&mut self, input: &[f32], output_grad: &[f32], lr: f32) {
+        assert_eq!(input.len(), self.input_dim);
+        assert_eq!(output_grad.len(), self.output_dim);
         for i in 0..self.input_dim {
+            let row_offset = i * self.output_dim;
             for j in 0..self.output_dim {
-                self.weight[i][j] -= lr * input[i] * output_grad[j];
+                self.weight[row_offset + j] -= lr * input[i] * output_grad[j];
             }
         }
     }

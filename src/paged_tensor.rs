@@ -183,13 +183,40 @@ impl PagedTensorManager {
     }
 }
 
-// ─── DRAM page allocator stub ───────────────────────────────────────────────
+// ─── DRAM page allocator ──────────────────────────────────────────────────────
+//
+// Uses mmap to allocate real DRAM-backed memory for paged-out tensor axes.
+// In production on a CXL-equipped system this would be replaced by CXL.mem
+// or DAX-aware allocation. For development/testing it uses anonymous mmap.
 
 fn allocate_dram_page(size: u64) -> u64 {
-    // In production: allocate from a pre-reserved DRAM pool.
-    // For now, return a synthetic address in the DRAM region (typically
-    // above 0x10000000000 for server-class systems with CXL).
-    0x100_0000_0000 + (size * 7) // deterministic pseudorandom for testing
+    // In production: allocate from a pre-reserved CXL DRAM pool.
+    // For development: mmap anonymous page-backed memory.
+    let ptr = unsafe {
+        libc::mmap(
+            core::ptr::null_mut(),
+            size as libc::size_t,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        // Fallback: return a well-known sentinel that the caller checks
+        return 0;
+    }
+    ptr as u64
+}
+
+/// Free a previously allocated DRAM page.
+#[allow(dead_code)]
+fn free_dram_page(addr: u64, size: u64) {
+    if addr != 0 {
+        unsafe {
+            libc::munmap(addr as *mut libc::c_void, size as libc::size_t);
+        }
+    }
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────

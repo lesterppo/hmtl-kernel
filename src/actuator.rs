@@ -14,7 +14,6 @@
 // values extracted from the ActuatorCommand.
 
 use crate::types::Fp8;
-use core::arch::asm;
 
 // ─── ActuatorCommand ────────────────────────────────────────────────────────
 
@@ -259,10 +258,31 @@ impl Actuator {
 
 // ─── Hardware actuation stubs ───────────────────────────────────────────────
 
-#[inline(always)]
-unsafe fn set_task_affinity(_task_id: usize, _core: usize) {
-    // Production: invoke sched_setaffinity syscall or write to LAPIC ICR.
-    // Stub: no-op for development.
+/// Set CPU affinity for a task (Linux sched_setaffinity syscall).
+///
+/// In production this pins the task to the given core.
+/// The function uses `libc::sched_setaffinity` which calls the kernel's
+/// `sched_setaffinity` syscall to migrate the task to the target core.
+///
+/// # Safety
+/// Must be called with a valid TID and core index.
+#[inline]
+unsafe fn set_task_affinity(tid: usize, core: usize) {
+    use std::mem;
+
+    // Build a cpu_set_t with only the target core set
+    let mut cpuset: libc::cpu_set_t = mem::zeroed();
+    let set_size = mem::size_of::<libc::cpu_set_t>();
+
+    unsafe {
+        libc::CPU_ZERO(&mut cpuset);
+        libc::CPU_SET(core, &mut cpuset);
+        libc::sched_setaffinity(
+            tid as libc::pid_t,
+            set_size,
+            &cpuset as *const libc::cpu_set_t,
+        );
+    }
 }
 
 // ─── x86 CR3 manipulation (page-table base switching) ──────────────────────
@@ -270,25 +290,65 @@ unsafe fn set_task_affinity(_task_id: usize, _core: usize) {
 // Used for microsecond-level task migration: write a new page-table base
 // directly into CR3 to context-switch the MMU without going through the
 // OS scheduler.  This is the ultimate zero-overhead context switch.
+//
+// # Safety (CRITICAL — read before use)
+//
+// These functions write directly to the x86 CR3 control register.
+// They WILL cause a #GP (general protection fault) or instant triple-fault
+// if called from userspace (ring 3).  They are ONLY valid in ring 0
+// (kernel mode).
+//
+// CONDITIONS FOR SAFE USE:
+//   1. Must be called from kernel context (ring 0)
+//   2. `switch_page_table` requires that `new_cr3` points to a valid,
+//      properly-initialized page table hierarchy
+//   3. The current code segment, stack, and GDT/IDT must be identity-mapped
+//      in the new page table, OR a long-jump (ljmp) must follow immediately
+//   4. Interrupts MUST be disabled (CLI) before switching
+//
+// DO NOT call these from userspace tests — they will segfault instantly.
 
+/// Switch the MMU to a new page table by writing CR3.
+///
+/// # Safety
+/// Kernel-mode ONLY. See module-level safety conditions.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[inline(always)]
 pub unsafe fn switch_page_table(new_cr3: u64) {
-    asm!(
+    core::arch::asm!(
         "mov cr3, {}",
         in(reg) new_cr3,
         options(nostack, preserves_flags)
     );
 }
 
+/// Read the current CR3 value.
+///
+/// Reading CR3 is safe from any privilege level on x86_64;
+/// it returns the physical address of the top-level page table.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[inline(always)]
 pub unsafe fn read_cr3() -> u64 {
     let cr3: u64;
-    asm!(
+    core::arch::asm!(
         "mov {}, cr3",
         out(reg) cr3,
         options(nostack, preserves_flags)
     );
     cr3
+}
+
+// On non-x86 architectures, provide compile-time stubs
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+#[inline(always)]
+pub unsafe fn switch_page_table(_new_cr3: u64) {
+    compile_error!("switch_page_table is only available on x86/x86_64");
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+#[inline(always)]
+pub unsafe fn read_cr3() -> u64 {
+    compile_error!("read_cr3 is only available on x86/x86_64");
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -324,13 +384,15 @@ mod tests {
         let mut cmd = ActuatorCommand {
             target_dispatch_map: [[Fp8::ZERO; 128]; 128],
         };
-        // Set row 0: core 42 gets weight 1.0, all others 0
-        cmd.target_dispatch_map[0][42] = Fp8::ONE;
-
         let actuator = Actuator::new();
+        // Pick a valid core that exists on this system
+        let target_core = if actuator.num_cpus > 1 { 1 } else { 0 };
+        cmd.target_dispatch_map[0][target_core] = Fp8::ONE;
+
         let result = unsafe { actuator.dispatch_one(&cmd, 0) };
         assert!(result.is_ok(), "Dispatch should succeed");
-        assert_eq!(result.unwrap(), 42, "Dispatch should select core 42");
+        assert_eq!(result.unwrap(), target_core,
+            "Dispatch should select core {}", target_core);
     }
 
     #[test]
